@@ -128,7 +128,8 @@ export default function Home() {
   const [previewJSON, setPreviewJSON] = useState<any | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8000';
+  // Use relative '/api' and let Next rewrites forward to backend
+  const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || '/api';
 
   const uniquePickups = useMemo(() => {
     const s = new Set<string>();
