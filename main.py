@@ -19,10 +19,8 @@ import requests  # for handling HTTP errors
 
 from delhivery_client import DelhiveryClient
 from dotenv import load_dotenv
-from sqlalchemy.orm import Session
-from sqlalchemy import func
-
-from db import SessionLocal, init_db, Order, ManifestBatch, ManifestLog, upsert_order_from_row, extract_waybills_from_response
+from bson import ObjectId
+from db import get_db as get_mongo_db, init_db, upsert_order_from_row, extract_waybills_from_response
 import logging
 import json as _json
 
@@ -54,18 +52,19 @@ app.add_middleware(
 )
 
 
-def get_db() -> Session:
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+def get_db():
+    # Yields a PyMongo Database
+    db = get_mongo_db()
+    yield db
 
 
 @app.on_event("startup")
 def on_startup():
     # Ensure tables exist before handling requests
-    init_db()
+    try:
+        init_db()
+    except Exception as e:
+        logger.exception("Failed to initialize Mongo indexes: %s", e)
     # Configure logging level
     level = os.getenv("LOG_LEVEL", "INFO").upper()
     # Ensure root handler exists so custom loggers propagate to console
@@ -125,7 +124,7 @@ async def pincode_serviceability(filter_codes: str = Query(..., description="Com
 async def create_order(
     order_details: Dict[str, Any] = Body(..., description="Order payload as per Delhivery docs"),
     client: DelhiveryClient = Depends(get_client),
-    db: Session = Depends(get_db),
+    db = Depends(get_db),
 ) -> Dict[str, Any]:
     """Create and manifest a new order.
 
@@ -146,29 +145,29 @@ async def create_order(
         except Exception:
             pickup_name = None
 
-        batch = ManifestBatch(pickup_location_name=pickup_name, total_count=len(order_details.get("shipments", []) or []), status="pending")
-        db.add(batch)
-        db.flush()
-
-        # Log request
-        db.add(ManifestLog(batch_id=batch.id, operation="create", request_payload=order_details))
-        db.commit()
-        db.refresh(batch)
+        batch_doc = {
+            "created_at": _now_iso(),
+            "pickup_location_name": pickup_name,
+            "total_count": len(order_details.get("shipments", []) or []),
+            "status": "pending",
+        }
+        res = db.manifest_batches.insert_one(batch_doc)
+        batch_id = res.inserted_id
+        db.manifest_logs.insert_one({"batch_id": batch_id, "operation": "create", "request_payload": order_details, "created_at": _now_iso()})
 
         # Console log — sanitized
         _payload_log = _json.dumps(_redact_tokens(order_details), ensure_ascii=False)
-        logger.info("[MANIFEST][batch=%s] Request payload to Delhivery: %s", batch.id, _payload_log)
+        logger.info("[MANIFEST][batch=%s] Request payload to Delhivery: %s", str(batch_id), _payload_log)
 
         # Call upstream
         resp = client.create_order(order_details)
 
         # Persist response log
-        log = ManifestLog(batch_id=batch.id, operation="create", response_payload=resp)
-        db.add(log)
+        db.manifest_logs.insert_one({"batch_id": batch_id, "operation": "create", "response_payload": resp, "created_at": _now_iso()})
 
         # Console log response
         _resp_log = _json.dumps(_redact_tokens(resp), ensure_ascii=False)
-        logger.info("[MANIFEST][batch=%s] Response from Delhivery: %s", batch.id, _resp_log)
+        logger.info("[MANIFEST][batch=%s] Response from Delhivery: %s", str(batch_id), _resp_log)
 
         # Attempt to map waybills back to orders and update
         mapping = extract_waybills_from_response(resp)
@@ -177,28 +176,25 @@ async def create_order(
             if not ord_id:
                 continue
             wb = mapping.get(ord_id)
-            # Create per-order log row
-            entry = ManifestLog(
-                batch_id=batch.id,
-                sale_order_number=ord_id,
-                operation="create",
-                request_payload=shp,
-                response_payload=None,
-                waybill=wb,
-            )
-            db.add(entry)
+            # per-order log
+            db.manifest_logs.insert_one({
+                "batch_id": batch_id,
+                "sale_order_number": ord_id,
+                "operation": "create",
+                "request_payload": shp,
+                "response_payload": None,
+                "waybill": wb,
+                "created_at": _now_iso(),
+            })
 
             # Update order if exists
-            o = db.query(Order).filter(Order.sale_order_number == ord_id).one_or_none()
-            if o:
-                o.waybill = wb
-                o.manifest_status = "manifested" if wb else o.manifest_status
-                o.manifested_at = func.now() if wb else o.manifested_at
-                db.add(o)
+            if wb:
+                db.orders.update_one(
+                    {"sale_order_number": ord_id},
+                    {"$set": {"waybill": wb, "manifest_status": "manifested", "manifested_at": _now_iso()}},
+                )
 
-        batch.status = "completed"
-        db.add(batch)
-        db.commit()
+        db.manifest_batches.update_one({"_id": batch_id}, {"$set": {"status": "completed"}})
 
         return resp
     except requests.HTTPError as exc:  # type: ignore
@@ -368,7 +364,7 @@ async def warehouse_edit(
 @app.post("/orders/import")
 async def import_orders(
     payload: Dict[str, Any] = Body(..., description="{ rows: Array<Record<string, any>> }"),
-    db: Session = Depends(get_db),
+    db = Depends(get_db),
 ) -> Dict[str, Any]:
     rows = payload.get("rows") or []
     if not isinstance(rows, list):
@@ -381,17 +377,12 @@ async def import_orders(
     for row in rows:
         if not isinstance(row, dict):
             continue
-        existing = None
         sale_order_number = str(row.get("Sale Order Number") or row.get("*Order ID") or "").strip()
-        if sale_order_number:
-            existing = (
-                db.query(Order).filter(Order.sale_order_number == sale_order_number).one_or_none()
-            )
-
-        order = upsert_order_from_row(db, row)
-        if order is None:
+        order_doc = upsert_order_from_row(db, row)
+        if order_doc is None:
             continue
-        if existing is None:
+        # naive determination: if the doc was recently created
+        if order_doc.get("created_at") and (order_doc.get("updated_at") == order_doc.get("created_at")):
             created += 1
         else:
             updated += 1
@@ -402,18 +393,14 @@ async def import_orders(
 
 
 @app.get("/orders")
-async def list_orders(db: Session = Depends(get_db)) -> Dict[str, Any]:
-    items = (
-        db.query(Order)
-        .order_by(Order.id.desc())
-        .all()
-    )
-    data = []
+async def list_orders(db = Depends(get_db)) -> Dict[str, Any]:
+    items = list(db.orders.find({}).sort("_id", -1))
+    data: List[Dict[str, Any]] = []
     for o in items:
-        row = dict(o.raw or {})
-        row["Sale Order Number"] = o.sale_order_number
-        row["Pickup Location Name"] = o.pickup_location_name
-        row["Waybill"] = o.waybill
+        row = dict(o.get("raw") or {})
+        row["Sale Order Number"] = o.get("sale_order_number")
+        row["Pickup Location Name"] = o.get("pickup_location_name")
+        row["Waybill"] = o.get("waybill")
         data.append(row)
     return {"count": len(data), "items": data}
 
@@ -450,54 +437,37 @@ def _redact_tokens(obj: Any):
         return obj
 
 
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
 # ----------------------
 # Debug endpoints (to inspect last payloads)
 # ----------------------
 
 @app.get("/debug/last-manifest")
-def debug_last_manifest(db: Session = Depends(get_db)) -> Dict[str, Any]:
-    row = (
-        db.query(ManifestLog)
-        .filter(ManifestLog.operation == "create")
-        .order_by(ManifestLog.id.desc())
-        .first()
-    )
+def debug_last_manifest(db = Depends(get_db)) -> Dict[str, Any]:
+    row = db.manifest_logs.find_one({"operation": "create"}, sort=[("_id", -1)])
     if not row:
         return {"message": "no manifest logs yet"}
-    return {
-        "id": row.id,
-        "created_at": str(row.created_at),
-        "batch_id": row.batch_id,
-        "sale_order_number": row.sale_order_number,
-        "request_payload": row.request_payload,
-        "response_payload": row.response_payload,
-        "waybill": row.waybill,
-    }
+    row["id"] = str(row.pop("_id"))
+    if row.get("batch_id") and isinstance(row["batch_id"], ObjectId):
+        row["batch_id"] = str(row["batch_id"])
+    return row
 
 @app.get("/debug/batch/{batch_id}")
-def debug_batch(batch_id: int, db: Session = Depends(get_db)) -> Dict[str, Any]:
-    logs = (
-        db.query(ManifestLog)
-        .filter(ManifestLog.batch_id == batch_id)
-        .order_by(ManifestLog.id.asc())
-        .all()
-    )
-    return {
-        "batch_id": batch_id,
-        "count": len(logs),
-        "logs": [
-            {
-                "id": l.id,
-                "created_at": str(l.created_at),
-                "operation": l.operation,
-                "sale_order_number": l.sale_order_number,
-                "waybill": l.waybill,
-                "request_payload": l.request_payload,
-                "response_payload": l.response_payload,
-            }
-            for l in logs
-        ],
-    }
+def debug_batch(batch_id: str, db = Depends(get_db)) -> Dict[str, Any]:
+    try:
+        bid = ObjectId(batch_id)
+    except Exception:
+        return {"error": "invalid batch_id"}
+    logs = list(db.manifest_logs.find({"batch_id": bid}).sort("_id", 1))
+    for l in logs:
+        l["id"] = str(l.pop("_id"))
+        if isinstance(l.get("batch_id"), ObjectId):
+            l["batch_id"] = str(l["batch_id"])
+    return {"batch_id": batch_id, "count": len(logs), "logs": logs}
 
 
 # ----------------------
@@ -637,7 +607,7 @@ def build_shipment_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return shipment
 
 
-def build_manifest_payload(db: Session, sale_order_numbers: List[str]) -> Dict[str, Any]:
+def build_manifest_payload(db, sale_order_numbers: List[str]) -> Dict[str, Any]:
     pickup = {
         "name": os.getenv("PICKUP_NAME", "Preetizen Lifestyle"),
         "city": os.getenv("PICKUP_CITY", "Kolkata"),
@@ -647,11 +617,11 @@ def build_manifest_payload(db: Session, sale_order_numbers: List[str]) -> Dict[s
 
     shipments: List[Dict[str, Any]] = []
     for ord_id in sale_order_numbers:
-        o = db.query(Order).filter(Order.sale_order_number == str(ord_id).strip()).one_or_none()
+        o = db.orders.find_one({"sale_order_number": str(ord_id).strip()})
         if not o:
             continue
-        row = dict(o.raw or {})
-        row.setdefault("Sale Order Number", o.sale_order_number)
+        row = dict(o.get("raw") or {})
+        row.setdefault("Sale Order Number", o.get("sale_order_number"))
         shipments.append(build_shipment_from_row(row))
 
     payload = {"shipments": shipments, "pickup_location": pickup}
@@ -660,7 +630,7 @@ def build_manifest_payload(db: Session, sale_order_numbers: List[str]) -> Dict[s
 
 
 @app.post("/orders/build-manifest")
-async def api_build_manifest(body: Dict[str, Any] = Body(...), db: Session = Depends(get_db)) -> Dict[str, Any]:
+async def api_build_manifest(body: Dict[str, Any] = Body(...), db = Depends(get_db)) -> Dict[str, Any]:
     sale_order_numbers: List[str] = body.get("sale_order_numbers") or []
     if not isinstance(sale_order_numbers, list) or not sale_order_numbers:
         raise HTTPException(status_code=400, detail="Provide 'sale_order_numbers' as a non-empty list")
@@ -669,7 +639,7 @@ async def api_build_manifest(body: Dict[str, Any] = Body(...), db: Session = Dep
 
 
 @app.post("/orders/manifest-from-db")
-async def api_manifest_from_db(body: Dict[str, Any] = Body(...), client: DelhiveryClient = Depends(get_client), db: Session = Depends(get_db)) -> Dict[str, Any]:
+async def api_manifest_from_db(body: Dict[str, Any] = Body(...), client: DelhiveryClient = Depends(get_client), db = Depends(get_db)) -> Dict[str, Any]:
     sale_order_numbers: List[str] = body.get("sale_order_numbers") or []
     if not isinstance(sale_order_numbers, list) or not sale_order_numbers:
         raise HTTPException(status_code=400, detail="Provide 'sale_order_numbers' as a non-empty list")
@@ -682,32 +652,40 @@ async def api_manifest_from_db(body: Dict[str, Any] = Body(...), client: Delhive
         return {"dry_run": True, "payload": payload}
 
     # Create a batch and logs similar to /orders
-    batch = ManifestBatch(pickup_location_name=payload["pickup_location"]["name"], total_count=len(payload["shipments"]), status="pending")
-    db.add(batch)
-    db.flush()
-    db.add(ManifestLog(batch_id=batch.id, operation="create", request_payload=payload))
-    db.commit()
-    db.refresh(batch)
+    batch_doc = {
+        "created_at": _now_iso(),
+        "pickup_location_name": payload["pickup_location"]["name"],
+        "total_count": len(payload["shipments"]),
+        "status": "pending",
+    }
+    res = db.manifest_batches.insert_one(batch_doc)
+    batch_id = res.inserted_id
+    db.manifest_logs.insert_one({"batch_id": batch_id, "operation": "create", "request_payload": payload, "created_at": _now_iso()})
 
     resp = client.create_order(payload)
-    db.add(ManifestLog(batch_id=batch.id, operation="create", response_payload=resp))
+    db.manifest_logs.insert_one({"batch_id": batch_id, "operation": "create", "response_payload": resp, "created_at": _now_iso()})
 
     # Map waybills
     mapping = extract_waybills_from_response(resp)
     for shp in payload["shipments"]:
         ord_id = str(shp.get("order") or "").strip()
         wb = mapping.get(ord_id)
-        db.add(ManifestLog(batch_id=batch.id, sale_order_number=ord_id, operation="create", request_payload=shp, response_payload=None, waybill=wb))
-        o = db.query(Order).filter(Order.sale_order_number == ord_id).one_or_none()
-        if o and wb:
-            o.waybill = wb
-            o.manifest_status = "manifested"
-            o.manifested_at = func.now()
-            db.add(o)
+        db.manifest_logs.insert_one({
+            "batch_id": batch_id,
+            "sale_order_number": ord_id,
+            "operation": "create",
+            "request_payload": shp,
+            "response_payload": None,
+            "waybill": wb,
+            "created_at": _now_iso(),
+        })
+        if wb:
+            db.orders.update_one(
+                {"sale_order_number": ord_id},
+                {"$set": {"waybill": wb, "manifest_status": "manifested", "manifested_at": _now_iso()}},
+            )
 
-    batch.status = "completed"
-    db.add(batch)
-    db.commit()
+    db.manifest_batches.update_one({"_id": batch_id}, {"$set": {"status": "completed"}})
     return resp
 
 

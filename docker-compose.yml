@@ -1,31 +1,11 @@
 version: "3.9"
 
 services:
-  db:
-    image: postgres:16
-    environment:
-      POSTGRES_DB: delhivery
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-    ports:
-      - "5433:5432"  # avoid conflict if host Postgres uses 5432
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "postgres"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-
   backend:
     build:
       context: .
       dockerfile: Dockerfile.backend
-    depends_on:
-      db:
-        condition: service_healthy
     environment:
-      DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/delhivery
       LOG_LEVEL: DEBUG
       DRY_RUN: "true"
     env_file:
@@ -39,7 +19,7 @@ services:
       dockerfile: Dockerfile
       args:
         NEXT_PUBLIC_API_BASE_URL: /api
-        NEXT_BACKEND_URL: http://localhost:8000
+        NEXT_BACKEND_URL: http://backend:8000
         NEXT_PUBLIC_PICKUP_NAME: Preetizen Lifestyle
         NEXT_PUBLIC_PICKUP_CITY: Kolkata
         NEXT_PUBLIC_PICKUP_PIN: "700107"
@@ -50,11 +30,9 @@ services:
         NEXT_PUBLIC_CONSIGNEE_GST_TIN: 27ABCDE1234F1Z5
         NEXT_PUBLIC_GST_CESS_AMOUNT: "35.25"
     environment:
-      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+      NEXT_PUBLIC_API_BASE_URL: /api
+      NEXT_BACKEND_URL: http://backend:8000
     depends_on:
       - backend
     ports:
       - "3000:3000"
-
-volumes:
-  pgdata:
