@@ -9,7 +9,7 @@ COPY . .
 
 # Build-time env for Next.js public runtime
 ARG NEXT_PUBLIC_API_BASE_URL=/api
-ARG NEXT_BACKEND_URL=http://backend:8000
+ARG NEXT_BACKEND_URL=https://preetizen-backend.onrender.com
 ARG NEXT_PUBLIC_PICKUP_NAME="Preetizen Lifestyle"
 ARG NEXT_PUBLIC_PICKUP_CITY=Kolkata
 ARG NEXT_PUBLIC_PICKUP_PIN=700107
