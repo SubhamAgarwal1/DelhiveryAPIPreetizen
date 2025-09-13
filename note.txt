@@ -1,0 +1,71 @@
+Create Order Json:
+
+{
+    "shipments": [
+        {
+            "add": "106 kiran chandra singha road shibpur howrah 2",
+            "address_type": "home",
+            "phone": "8697057961",
+            "payment_mode": "Prepaid",
+            "name": "Subham Agarwal",
+            "pin": 711102,
+            "order": "53368896249",
+            "consignee_gst_amount": "150.00",
+            "integrated_gst_amount": "275.50",
+            "consignee_gst_tin": "27ABCDE1234F1Z5",
+            "hsn_code": "851770",
+            "gst_cess_amount": "35.25",
+            "total_amount" : "100.00",
+            "product_desc": "Smartphone",
+            "weight": "0.25"
+        }
+    ],
+    "pickup_location": {
+        "name": "Preetizen Lifestyle",
+        "city": "Kolkata",
+        "pin": "700107"
+    }
+}
+
+
+Edit Order Json:
+
+{
+  "waybill": "39033010006893",
+  "order_id": "PZ10843-1",
+  "name": "Jane Doe",
+  "add": "123 Baker Street, London",
+  "phone": "9876543210",
+  "cod": 0,
+  "gm": 250.0,
+  "shipment_length": 20,
+  "shipment_width": 15,
+  "shipment_height": 5,
+  "prd": "Kajol Kotha Full Shirt - Size: L - Colour: Black",
+  "pt": "Prepaid"
+}
+
+
+Cancle Order: 
+
+{
+    "waybill": "39033010006974",
+    "cancellation": "true"
+}
+
+
+
+
+
+I want to create a frontend where I will be giving this csv which has the list of orders.
+Then I will select the orders and perform the api actions. 
+In the notes there is a json format in which the delhivery api gets its payload. 
+The CSV orders will be converted into the json exactly like how its shown. 
+So write the scripts to convert the CSV into json and make the frontend in nextjs. 
+Also make the user import the CSV of the orders like the one I sent here in the attachment. 
+After importing the CSV it will show the orders list to the user. 
+User will select the order by clicking on the checkbox. 
+After selecting the checkboxs user will create manifest/create order button 
+which will call the manifest api from the delhivery_python_api.py. 
+After the manifestations are done the json payload the api will provide
+will be saved in a new csv will the waybill numbers which the user will export.
